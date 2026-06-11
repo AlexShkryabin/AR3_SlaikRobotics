@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """AR4 teleop GUI with joint and Cartesian jog modes."""
 
+import json
 import math
 import threading
 import time
 import tkinter as tk
+from tkinter import filedialog
 
 import rclpy
 from geometry_msgs.msg import TwistStamped
@@ -38,6 +40,9 @@ DEFAULT_WAYPOINT_SEGMENT_TIME = 1.8
 DEFAULT_WAYPOINT_STALL_TIMEOUT_SEC = 2.5
 DEFAULT_WAYPOINT_MAX_SPEED_DEG_S = 20.0
 DEFAULT_WAYPOINT_MAX_ACCEL_DEG_S2 = 40.0
+DEFAULT_POINT_SPEED_SCALE = 1.0
+DEFAULT_POINT_STOP = False
+DEFAULT_POINT_STOP_SEC = 0.0
 SERVO_READY_POSITION = [0.0, 0.0, -1.5708, 0.0, 0.0, 0.0]
 
 
@@ -240,12 +245,58 @@ class TeleopGUI(Node):
 
         self.waypoint_list = tk.Listbox(right, height=7, exportselection=False)
         self.waypoint_list.pack(fill="both", expand=True)
+        self.waypoint_list.bind("<<ListboxSelect>>", self._on_waypoint_select)
+
+        settings_frame = tk.LabelFrame(right, text="Point Settings")
+        settings_frame.pack(fill="x", pady=(8, 8))
+
+        tk.Label(settings_frame, text="Speed scale").grid(row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+        self.point_speed_var = tk.DoubleVar(value=DEFAULT_POINT_SPEED_SCALE)
+        tk.Entry(settings_frame, textvariable=self.point_speed_var, width=8).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=6,
+            pady=(6, 2),
+        )
+
+        self.point_stop_var = tk.BooleanVar(value=DEFAULT_POINT_STOP)
+        tk.Checkbutton(settings_frame, text="Stop at point", variable=self.point_stop_var).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=6,
+            pady=(2, 2),
+        )
+
+        tk.Label(settings_frame, text="Stop sec").grid(row=1, column=1, sticky="w", padx=6, pady=(2, 2))
+        self.point_stop_sec_var = tk.DoubleVar(value=DEFAULT_POINT_STOP_SEC)
+        tk.Entry(settings_frame, textvariable=self.point_stop_sec_var, width=8).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=6,
+            pady=(2, 2),
+        )
+
+        tk.Button(settings_frame, text="Apply to selected", command=self._apply_waypoint_settings).grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            padx=6,
+            pady=(4, 6),
+        )
 
         waypoint_buttons = tk.Frame(right)
         waypoint_buttons.pack(fill="x", pady=(8, 0))
 
         tk.Button(waypoint_buttons, text="Add point (current pose)", command=self._save_waypoint).pack(fill="x", pady=(0, 6))
         tk.Button(waypoint_buttons, text="Delete selected", command=self._delete_waypoint).pack(fill="x", pady=(0, 6))
+        tk.Button(waypoint_buttons, text="Move up", command=self._move_waypoint_up).pack(fill="x", pady=(0, 6))
+        tk.Button(waypoint_buttons, text="Move down", command=self._move_waypoint_down).pack(fill="x", pady=(0, 6))
+        tk.Button(waypoint_buttons, text="Export points", command=self._export_waypoints).pack(fill="x", pady=(0, 6))
+        tk.Button(waypoint_buttons, text="Import points", command=self._import_waypoints).pack(fill="x", pady=(0, 6))
         tk.Button(waypoint_buttons, text="Start path (from first)", command=self._run_waypoints, bg="#e8f5e9").pack(fill="x")
 
         self.status = tk.Label(right, text="Initializing...", fg="gray", justify="left", wraplength=340)
@@ -430,20 +481,128 @@ class TeleopGUI(Node):
         waypoint_index = len(self.waypoints) + 1
         joints = list(self.current_joints)
         waypoint_name = f"WP{waypoint_index:02d}"
-        self.waypoints.append({"name": waypoint_name, "joints": joints})
-        self.waypoint_list.insert(tk.END, f"{waypoint_name}: {self._format_joint_degrees(joints)}")
+        self.waypoints.append(
+            {
+                "name": waypoint_name,
+                "joints": joints,
+                "speed_scale": self._read_point_speed_scale(),
+                "stop": bool(self.point_stop_var.get()),
+                "stop_sec": self._read_point_stop_sec(),
+            }
+        )
+        self._refresh_waypoint_list(select_index=len(self.waypoints) - 1)
         self._set_status(f"Saved {waypoint_name}", "green")
 
     def _delete_waypoint(self):
-        selection = self.waypoint_list.curselection()
-        if not selection:
+        index = self._selected_waypoint_index()
+        if index is None:
             self._set_status("Select a waypoint first", "orange")
             return
 
-        index = int(selection[0])
-        self.waypoint_list.delete(index)
         del self.waypoints[index]
+        next_index = min(index, len(self.waypoints) - 1) if self.waypoints else None
+        self._refresh_waypoint_list(select_index=next_index)
         self._set_status("Waypoint deleted", "green")
+
+    def _move_waypoint_up(self):
+        index = self._selected_waypoint_index()
+        if index is None:
+            self._set_status("Select a waypoint first", "orange")
+            return
+        if index == 0:
+            return
+        self.waypoints[index - 1], self.waypoints[index] = self.waypoints[index], self.waypoints[index - 1]
+        self._refresh_waypoint_list(select_index=index - 1)
+
+    def _move_waypoint_down(self):
+        index = self._selected_waypoint_index()
+        if index is None:
+            self._set_status("Select a waypoint first", "orange")
+            return
+        if index >= len(self.waypoints) - 1:
+            return
+        self.waypoints[index + 1], self.waypoints[index] = self.waypoints[index], self.waypoints[index + 1]
+        self._refresh_waypoint_list(select_index=index + 1)
+
+    def _on_waypoint_select(self, _event=None):
+        index = self._selected_waypoint_index()
+        if index is None:
+            return
+        waypoint = self.waypoints[index]
+        self.point_speed_var.set(float(waypoint.get("speed_scale", DEFAULT_POINT_SPEED_SCALE)))
+        self.point_stop_var.set(bool(waypoint.get("stop", DEFAULT_POINT_STOP)))
+        self.point_stop_sec_var.set(float(waypoint.get("stop_sec", DEFAULT_POINT_STOP_SEC)))
+
+    def _apply_waypoint_settings(self):
+        index = self._selected_waypoint_index()
+        if index is None:
+            self._set_status("Select a waypoint first", "orange")
+            return
+        self.waypoints[index]["speed_scale"] = self._read_point_speed_scale()
+        self.waypoints[index]["stop"] = bool(self.point_stop_var.get())
+        self.waypoints[index]["stop_sec"] = self._read_point_stop_sec()
+        self._refresh_waypoint_list(select_index=index)
+        self._set_status(f"Updated {self.waypoints[index]['name']}", "green")
+
+    def _export_waypoints(self):
+        if not self.waypoints:
+            self._set_status("No waypoints to export", "orange")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export waypoints",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        payload = {
+            "format": "ar4_teleop_waypoints_v1",
+            "joint_names": list(self.joint_names),
+            "waypoints": self.waypoints,
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        self._set_status(f"Exported {len(self.waypoints)} points", "green")
+
+    def _import_waypoints(self):
+        path = filedialog.askopenfilename(
+            title="Import waypoints",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        raw_waypoints = payload.get("waypoints") if isinstance(payload, dict) else None
+        if not isinstance(raw_waypoints, list):
+            self._set_status("Invalid waypoint file", "red")
+            return
+
+        imported = []
+        for idx, item in enumerate(raw_waypoints, start=1):
+            if not isinstance(item, dict):
+                continue
+            joints = item.get("joints")
+            if not isinstance(joints, list) or len(joints) != len(self.joint_names):
+                continue
+            imported.append(
+                {
+                    "name": str(item.get("name", f"WP{idx:02d}")),
+                    "joints": [float(value) for value in joints],
+                    "speed_scale": max(0.05, float(item.get("speed_scale", DEFAULT_POINT_SPEED_SCALE))),
+                    "stop": bool(item.get("stop", DEFAULT_POINT_STOP)),
+                    "stop_sec": max(0.0, float(item.get("stop_sec", DEFAULT_POINT_STOP_SEC))),
+                }
+            )
+
+        if not imported:
+            self._set_status("No valid waypoints in file", "red")
+            return
+
+        self.waypoints = imported
+        self._refresh_waypoint_list(select_index=0)
+        self._set_status(f"Imported {len(self.waypoints)} points", "green")
 
     def _run_waypoints(self):
         if not self.waypoints:
@@ -506,13 +665,17 @@ class TeleopGUI(Node):
 
         elapsed = 0.0
         per_segment_min = max(self.waypoint_segment_time, 0.2)
-        max_speed_rad_s = math.radians(max(self.waypoint_max_speed_deg_s, 1.0))
-        max_accel_rad_s2 = math.radians(max(self.waypoint_max_accel_deg_s2, 1.0))
+        base_max_speed_rad_s = math.radians(max(self.waypoint_max_speed_deg_s, 1.0))
+        base_max_accel_rad_s2 = math.radians(max(self.waypoint_max_accel_deg_s2, 1.0))
         previous = list(self.current_joints)
         times = []
         positions = []
+        point_meta = []
 
         for waypoint in waypoints:
+            speed_scale = max(0.05, float(waypoint.get("speed_scale", DEFAULT_POINT_SPEED_SCALE)))
+            max_speed_rad_s = base_max_speed_rad_s * speed_scale
+            max_accel_rad_s2 = base_max_accel_rad_s2 * speed_scale
             delta_max = max(
                 self._shortest_angular_distance(cur, tgt)
                 for cur, tgt in zip(previous, waypoint["joints"])
@@ -530,11 +693,23 @@ class TeleopGUI(Node):
 
             times.append(elapsed)
             positions.append(list(waypoint["joints"]))
+            point_meta.append({"stop": bool(waypoint.get("stop", DEFAULT_POINT_STOP))})
             previous = list(waypoint["joints"])
+
+            if bool(waypoint.get("stop", DEFAULT_POINT_STOP)) and float(waypoint.get("stop_sec", DEFAULT_POINT_STOP_SEC)) > 0.0:
+                elapsed += max(0.0, float(waypoint.get("stop_sec", DEFAULT_POINT_STOP_SEC)))
+                hold = JointTrajectoryPoint()
+                hold.positions = list(waypoint["joints"])
+                hold.time_from_start.sec = int(elapsed)
+                hold.time_from_start.nanosec = int((elapsed - int(elapsed)) * 1e9)
+                message.points.append(hold)
+                times.append(elapsed)
+                positions.append(list(waypoint["joints"]))
+                point_meta.append({"stop": True, "hold": True})
 
         zero = [0.0] * len(self.joint_names)
         for i, point in enumerate(message.points):
-            if i == 0 or i == len(message.points) - 1:
+            if i == 0 or i == len(message.points) - 1 or point_meta[i].get("stop"):
                 point.velocities = list(zero)
                 point.accelerations = list(zero)
                 continue
@@ -544,7 +719,7 @@ class TeleopGUI(Node):
                 point.velocities = list(zero)
             else:
                 v = [(positions[i + 1][j] - positions[i - 1][j]) / dt for j in range(len(self.joint_names))]
-                point.velocities = [max(min(value, max_speed_rad_s), -max_speed_rad_s) for value in v]
+                point.velocities = [max(min(value, base_max_speed_rad_s), -base_max_speed_rad_s) for value in v]
 
             dt_prev = times[i] - times[i - 1]
             dt_next = times[i + 1] - times[i]
@@ -561,19 +736,58 @@ class TeleopGUI(Node):
                     for j in range(len(self.joint_names))
                 ]
                 point.accelerations = [
-                    max(min(value, max_accel_rad_s2), -max_accel_rad_s2)
+                    max(min(value, base_max_accel_rad_s2), -base_max_accel_rad_s2)
                     for value in a
                 ]
 
         self.publisher.publish(message)
         self._set_status("Smooth path trajectory sent", "green")
+        stop_count = sum(1 for waypoint in waypoints if bool(waypoint.get("stop", DEFAULT_POINT_STOP)))
         self.get_logger().info(
             f"Published smooth trajectory with {len(message.points)} points "
             f"(min-segment {per_segment_min:.2f}s, max_speed {self.waypoint_max_speed_deg_s:.1f} deg/s, "
             f"max_accel {self.waypoint_max_accel_deg_s2:.1f} deg/s^2, "
-            f"total {elapsed:.2f}s)"
+            f"stops {stop_count}, total {elapsed:.2f}s)"
         )
         return elapsed
+
+    def _selected_waypoint_index(self):
+        selection = self.waypoint_list.curselection()
+        if not selection:
+            return None
+        return int(selection[0])
+
+    def _refresh_waypoint_list(self, select_index=None):
+        self.waypoint_list.delete(0, tk.END)
+        for idx, waypoint in enumerate(self.waypoints, start=1):
+            self.waypoint_list.insert(tk.END, self._waypoint_display_text(idx, waypoint))
+
+        if select_index is not None and 0 <= select_index < len(self.waypoints):
+            self.waypoint_list.selection_set(select_index)
+            self.waypoint_list.activate(select_index)
+            self._on_waypoint_select()
+
+    def _waypoint_display_text(self, index, waypoint):
+        speed_scale = float(waypoint.get("speed_scale", DEFAULT_POINT_SPEED_SCALE))
+        stop = bool(waypoint.get("stop", DEFAULT_POINT_STOP))
+        stop_sec = float(waypoint.get("stop_sec", DEFAULT_POINT_STOP_SEC))
+        stop_text = f"stop {stop_sec:.1f}s" if stop else "pass"
+        return (
+            f"{index:02d}. {waypoint['name']} | x{speed_scale:.2f} | {stop_text} | "
+            f"{self._format_joint_degrees(waypoint['joints'])}"
+        )
+
+    def _read_point_speed_scale(self):
+        try:
+            return max(0.05, float(self.point_speed_var.get()))
+        except (TypeError, ValueError):
+            return DEFAULT_POINT_SPEED_SCALE
+
+    def _read_point_stop_sec(self):
+        try:
+            return max(0.0, float(self.point_stop_sec_var.get()))
+        except (TypeError, ValueError):
+            return DEFAULT_POINT_STOP_SEC
 
     def _publish_target(self, target_joints, status_text=None):
         message = JointTrajectory()
